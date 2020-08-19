@@ -1,0 +1,161 @@
+---
+version: "2.0"
+create_volume_backup:
+  type:                     direct
+  description:              |
+    Created by EveryWare AG, 2019-09-27, francois.scheurer@everyware.ch
+    2020-01-14 add rotate parameter
+
+    This workflow creates a backup of a volume to the swift service.
+    It actually creates a temporary snapshot of a volume and then moves it to swift.
+
+    References:
+    * https://docs.openstack.org/mistral/latest/user/wf_lang_v2.html
+    * https://yaql.readthedocs.io/en/latest/language_reference.html
+    * https://gitlab.cern.ch/cloud-infrastructure/mistral-workflows/blob/master/workflows/instance_snapshot.yaml
+
+    Description of the input params:
+    * volume_id:            volume to backup
+    * name:                 name of volume backup ($pattern will be appended)
+    * incremental:          number of incremental backups between full backups (0 for full only)
+    * rotate:               number of backups to keep (0 to disable rotation); note that if using incremental,
+                            the number of backups will be in interval [rotate, rotate + incremental]
+    * force:                true if backup allow when the volume is attached to a running VM
+    * to_addr_success:      email address of success or null
+    * to_addr_error:        email address of error or null
+  input:
+    - volume_id
+    - name
+    - incremental:          27
+    - force:                true
+    - rotate:               28
+    - to_addr_success:      null
+    - to_addr_error:        null
+    - pattern:              "{0}_backup_{1}"
+  output:
+    backup_id:              <% $.backup_id %>
+    backup_status:          <% $.backup_status %>
+
+  tasks:
+
+    init:
+      description:          'Validate and convert input paramters. Define variables.'
+      action:               std.noop
+      publish:
+        incremental:        <% int($.incremental) %>
+        force:              <% let(var => $.force) -> switch(isBoolean($var) => $var, not isBoolean($var) => $var.toLower() = 'true') %>
+        rotate:             <% int($.rotate) %>
+        backup_name:        <% $.pattern.format($.name, now().format("%Y%m%d%H%M")) %>
+        backup_regex:       <% $.pattern.format($.name, '*') %>
+      on-success:           backup_list
+
+    backup_list:
+      description:          'Get list of volume backups matching backup_regex.'
+      action:               cinder.backups_list
+      publish:
+        backup_list:        <% task().result.where($.status='available').where(regex(task(init).published.backup_regex).matches($.name)).orderBy($.created_at).id %>
+      on-success:
+        - rotate_backup:    <% $.rotate >= 1 %>
+        - create_backup:    <% $.rotate = 0 %>
+      on-error:             error_task
+
+    rotate_backup:
+      description:          'Rotate the volume backups.'
+      with-items:           backup_id2 in <% $.backup_list.take( [$.backup_list.len() + 1 - $.rotate, 0].max() ).reverse() %>
+      concurrency:          1
+      action:               cinder.backups_delete
+      input:
+        backup:             <% $.backup_id2 %>
+        force:              false
+      on-complete:          wait_on_delete
+
+    wait_on_delete:
+      description:          |
+        Because cinder.backups_delete is async, it "succeeds" immediately.
+        Therefore we need to poll here the backup_status via cinder.backups_list()
+        and continue waiting as long as there are some backups with status "deleting" and timeout is not reached.
+      action:               cinder.backups_list
+      retry:
+        delay:              60
+        count:              <% int(60*1) %>
+        continue-on:        <% task().result.where($.status='deleting').where(regex(task(init).published.backup_regex).matches($.name)).len() >= 1 %>
+      on-complete:          create_backup
+
+    create_backup:
+      description:          'Creates a volume backup.'
+      action:               cinder.backups_create
+      input:
+        volume_id:          <% $.volume_id %>
+        name:               <% $.backup_name %>
+        incremental:        <% $.backup_list.len() mod ($.incremental + 1) != 0 %>
+        force:              <% $.force %>
+      publish:
+        backup_id:          <% task().result.id %>
+        backup_status:      <% task().result.status %>
+      on-success:           wait_on_backup
+      on-error:             error_task
+
+    wait_on_backup:
+      description:          |
+        Because cinder.backups_create is async, it "succeeds" immediately.
+        Therefore we need to poll here the backup_status via cinder.backups_get(backup_id)
+        and continue waiting as long as it is "creating" and timeout is not reached.
+      action:               cinder.backups_get
+      input:
+        backup_id:          <% $.backup_id %>
+      retry:
+        delay:              60
+        count:              <% int(60*23) %>
+        break-on:           <% task().result.status = 'error' %>
+        continue-on:        <% task().result.status = 'creating' %>
+      publish:
+        backup_status:      <% task(wait_on_backup).result.status %>
+      on-success:
+        - success_task:     <% $.backup_status = 'available' %>
+        - error_task:       <% $.backup_status != 'available' %>
+      on-error:             error_task
+    
+    success_task:
+      description:          'Checks if a success mail has to be sent to the end user'
+      action:               std.noop
+      publish:
+        backup_id:          <% $.backup_id %>
+        backup_status:      <% $.backup_status %>
+      on-success:
+        - success_mail:     <% $.to_addr_success %>
+        - succeed
+
+    error_task:
+      description:          'Checks if an error mail has to be sent to the end user'
+      action:               std.noop
+      on-success:
+        - error_mail:       <% $.to_addr_error %>
+        - fail
+
+    success_mail:
+      description:          'Sends a success mail to the end user'
+      action:               std.email
+      input:
+        to_addrs:           <% $.to_addr_success.split(';') %>
+        subject:            Volume Backup created successfully
+        body:               |
+          The volume backup "<% $.backup_name %>" has been created successfully.
+          You can check the execution logs of the execution <% execution().id %>
+          -- Thanks, Openstack Team.
+        from_addr:          'noreply@everyware.ch'
+        smtp_server:        'smtp'
+
+    error_mail:
+      description:          'Sends an error mail to the end user'
+      action:               std.email
+      input:
+        to_addrs:           <% $.to_addr_error.split(';') %>
+        subject:            Volume Backup has failed
+        body:               |
+          The volume backup "<% $.backup_name %>" has failed.
+          Please check in the execution logs of the execution <% execution().id %>
+          -- Thanks, Openstack Team.
+        from_addr:          'noreply@everyware.ch'
+        smtp_server:        'smtp'
+
+
