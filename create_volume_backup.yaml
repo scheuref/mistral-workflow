@@ -16,6 +16,7 @@ create_volume_backup:
     * https://docs.openstack.org/mistral/latest/user/wf_lang_v2.html
     * https://yaql.readthedocs.io/en/latest/language_reference.html
     * https://gitlab.cern.ch/cloud-infrastructure/mistral-workflows/blob/master/workflows/instance_snapshot.yaml
+    * https://docs.stackstorm.com/workflows.html
 
     Description of the input params:
     * volume_id:            volume to backup
