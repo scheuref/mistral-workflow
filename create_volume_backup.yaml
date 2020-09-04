@@ -21,8 +21,12 @@ create_volume_backup:
     * volume_id:            volume to backup
     * name:                 name of volume backup ($pattern will be appended)
     * incremental:          number of incremental backups between full backups (0 for full only)
-    * rotate:               number of backups to keep (0 to disable rotation); note that if using incremental,
-                            the number of backups will be in interval [rotate, rotate + incremental]
+    * rotate:               number of backups to keep (0 to disable rotation);
+                            you should respect: rotate % (incremental + 1) = 0
+                            if incremental > 0 then nbr_backup is in an interval instead of constant:
+                            => nbr_backup:      [rotate,                        rotate + incremental]
+                            => nbr_full:        [rotate % incremental,          rotate % incremental + 1]
+                            => nbr_incremental: [rotate - rotate % incremental, rotate + incremental - rotate % incremental - 1]
     * force:                true if backup allow when the volume is attached to a running VM
     * to_addr_success:      email address of success or null
     * to_addr_error:        email address of error or null
