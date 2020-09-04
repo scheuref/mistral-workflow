@@ -3,10 +3,11 @@ version: "2.0"
 create_volume_backup:
   type:                     direct
   description:              |
-    Version 2.0
+    Version 2.1
     Created by EveryWare AG, 2019-09-27, francois.scheurer@everyware.ch
     2020-01-14 add rotate parameter
-    2020-09-02 return task(success_task).published.backup_status 
+    2020-09-02 return task(success_task).published.backup_status
+    2020-09-04 chg sender to noreply@ewsrv.ch
 
     This workflow creates a backup of a volume to the swift service.
     It actually creates a temporary snapshot of a volume and then moves it to swift.
@@ -151,7 +152,7 @@ create_volume_backup:
           The volume backup "<% $.backup_name %>" has been created successfully.
           You can check the execution logs of the execution <% execution().id %>
           -- Thanks, Openstack Team.
-        from_addr:          'noreply@everyware.ch'
+        from_addr:          'noreply@ewsrv.ch'
         smtp_server:        'smtp'
 
     error_mail:
@@ -164,5 +165,5 @@ create_volume_backup:
           The volume backup "<% $.backup_name %>" has failed.
           Please check in the execution logs of the execution <% execution().id %>
           -- Thanks, Openstack Team.
-        from_addr:          'noreply@everyware.ch'
+        from_addr:          'noreply@ewsrv.ch'
         smtp_server:        'smtp'
