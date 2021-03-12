@@ -3,11 +3,13 @@ version: "2.0"
 create_volume_backup:
   type:                     direct
   description:              |
-    Version 2.1
+    Version 2.3
     Created by EveryWare AG, 2019-09-27, francois.scheurer@everyware.ch
     2020-01-14 add rotate parameter
     2020-09-02 return task(success_task).published.backup_status
     2020-09-04 chg sender to noreply@ewsrv.ch
+    2021-02-04 improve error handling
+    2021-03-12 use cinder.backups_delete in an sequential loop instead of async
 
     This workflow creates a backup of a volume to the swift service.
     It actually creates a temporary snapshot of a volume and then moves it to swift.
@@ -71,15 +73,58 @@ create_volume_backup:
         - create_backup:    <% $.rotate = 0 %>
       on-error:             error_task
 
+# nok: all backups_delete are run async and all but the first fail because of incremental chain dependencies
+#    rotate_backup_old:
+#      description:          'Rotate the volume backups.'
+#      with-items:           backup_id2 in <% $.backup_list.take( [$.backup_list.len() + 1 - $.rotate, 0].max() ).reverse() %>
+#      concurrency:          1
+#      wait-before:          10
+#      action:               cinder.backups_delete
+#      input:
+#        backup:             <% $.backup_id2 %>
+#        force:              false
+#      on-complete:          wait_on_delete_old
+#
+#    wait_on_delete_old:
+#      description:          |
+#        Because cinder.backups_delete is async, it "succeeds" immediately.
+#        Therefore we need to poll here the backup_status via cinder.backups_list()
+#        and continue waiting as long as there are some backups with status "deleting" and timeout is not reached.
+#      action:               cinder.backups_list
+#      retry:
+#        delay:              60
+#        count:              <% int(60*1) %>
+#        continue-on:        <% task().result.where($.status='deleting').where(regex(task(init).published.backup_regex).matches($.name)).len() >= 1 %>
+#      on-complete:          create_backup
+
     rotate_backup:
-      description:          'Rotate the volume backups.'
-      with-items:           backup_id2 in <% $.backup_list.take( [$.backup_list.len() + 1 - $.rotate, 0].max() ).reverse() %>
-      concurrency:          1
+      description:          |
+        Rotate the volume backups.
+        backup_list is sorted by created_at; we want to keep only the last 'rotate - 1' elements,
+        so that after the creation a a new backup we have exactly 'rotate' backups.
+        Therefore we need to delete the first 'backup_list.len + 1 - rotate' elements.
+        We reverse the resulted list to deal with incremental dependencies.
+      action:               std.noop
+      publish:
+        delbackup_list:     <% $.backup_list.take( [$.backup_list.len() + 1 - $.rotate, 0].max() ).reverse() %>
+      on-success:
+        - delete_backup:    <% $.delbackup_list.len() >= 1 %>
+        - create_backup:    <% $.delbackup_list.len() = 0 %>
+
+    delete_backup:
+      description:          |
+        Delete first element of a volume backup list, recursively, until the list is empty.
+        Ignore delete errors.
       action:               cinder.backups_delete
       input:
-        backup:             <% $.backup_id2 %>
+        backup:             <% $.delbackup_list.first() %>
         force:              false
-      on-complete:          wait_on_delete
+      publish:
+        delbackup_list:     <% $.delbackup_list.skip(1) %>
+      publish-on-error:
+        delbackup_list:     <% $.delbackup_list.skip(1) %>
+      on-complete:
+        - wait_on_delete
 
     wait_on_delete:
       description:          |
@@ -91,7 +136,15 @@ create_volume_backup:
         delay:              60
         count:              <% int(60*1) %>
         continue-on:        <% task().result.where($.status='deleting').where(regex(task(init).published.backup_regex).matches($.name)).len() >= 1 %>
-      on-complete:          create_backup
+      publish:
+        backup_list:        <% task().result.where($.status='available').where(regex(task(init).published.backup_regex).matches($.name)).orderBy($.created_at).id %>
+      publish-on-error:
+        backup_id:          null
+        backup_status:      <% task().result %>
+      on-success:
+        - delete_backup:    <% $.delbackup_list.len() >= 1 %>
+        - create_backup:    <% $.delbackup_list.len() = 0 %>
+      on-error:             error_task
 
     create_backup:
       description:          'Creates a volume backup.'
@@ -104,6 +157,9 @@ create_volume_backup:
       publish:
         backup_id:          <% task().result.id %>
         backup_status:      <% task().result.status %>
+      publish-on-error:
+        backup_id:          null
+        backup_status:      <% task().result %>
       on-success:           wait_on_backup
       on-error:             error_task
 
